@@ -11,6 +11,16 @@ from utils import *
 
 
 def get_batches(pairs, neighbors, batch_size):
+    '''
+    :param pairs: -- train_pairs: node对(node1, node2, layer_id)
+    :param neighbors: neighbors'shape = (num_node, edge_type_count, neighbor_samples)
+                      记录每个node所相连的指定数量的邻居nodelist
+    :param batch_size:
+    :return:torch.tensor(x), source
+            torch.tensor(y), end
+            torch.tensor(t), edge_type
+            torch.tensor(neigh)=edge_type_count, neighbor_samples
+    '''
     n_batches = (len(pairs) + (batch_size - 1)) // batch_size
 
     for idx in range(n_batches):
@@ -19,10 +29,10 @@ def get_batches(pairs, neighbors, batch_size):
             index = idx * batch_size + i
             if index >= len(pairs):
                 break
-            x.append(pairs[index][0])
-            y.append(pairs[index][1])
-            t.append(pairs[index][2])
-            neigh.append(neighbors[pairs[index][0]])
+            x.append(pairs[index][0]) #source node
+            y.append(pairs[index][1]) #end node
+            t.append(pairs[index][2]) #edge type
+            neigh.append(neighbors[pairs[index][0]]) #source node的邻居
         yield torch.tensor(x), torch.tensor(y), torch.tensor(t), torch.tensor(neigh)
 
 
@@ -31,29 +41,30 @@ class GATNEModel(nn.Module):
         self, num_nodes, embedding_size, embedding_u_size, edge_type_count, dim_a, features
     ):
         super(GATNEModel, self).__init__()
-        self.num_nodes = num_nodes
-        self.embedding_size = embedding_size
-        self.embedding_u_size = embedding_u_size
-        self.edge_type_count = edge_type_count
-        self.dim_a = dim_a
-
+        self.num_nodes = num_nodes #节点数量
+        self.embedding_size = embedding_size #每个节点输出的embedding纬度
+        self.embedding_u_size = embedding_u_size #节点作为邻居初始化size
+        self.edge_type_count = edge_type_count #类别数量
+        self.dim_a = dim_a #中间隐层特征数量
         self.features = None
-        if features is not None:
+
+        if features is not None: #GATNE-I
             self.features = features
             feature_dim = self.features.shape[-1]
             self.embed_trans = Parameter(torch.FloatTensor(feature_dim, embedding_size))
             self.u_embed_trans = Parameter(torch.FloatTensor(edge_type_count, feature_dim, embedding_u_size))
-        else:
+        else: #初始化 base embedding
             self.node_embeddings = Parameter(torch.FloatTensor(num_nodes, embedding_size))
-            self.node_type_embeddings = Parameter(
+            self.node_type_embeddings = Parameter( #初始化  edge embedding
                 torch.FloatTensor(num_nodes, edge_type_count, embedding_u_size)
             )
-        self.trans_weights = Parameter(
+        self.trans_weights = Parameter( #定义Mr矩阵
             torch.FloatTensor(edge_type_count, embedding_u_size, embedding_size)
         )
-        self.trans_weights_s1 = Parameter(
-            torch.FloatTensor(edge_type_count, embedding_u_size, dim_a)
+        self.trans_weights_s1 = Parameter( #Wr计算attention使用
+           torch.FloatTensor(edge_type_count, embedding_u_size, dim_a)
         )
+        #wr计算attention使用
         self.trans_weights_s2 = Parameter(torch.FloatTensor(edge_type_count, dim_a, 1))
 
         self.reset_parameters()
@@ -70,26 +81,47 @@ class GATNEModel(nn.Module):
         self.trans_weights_s2.data.normal_(std=1.0 / math.sqrt(self.embedding_size))
 
     def forward(self, train_inputs, train_types, node_neigh):
+        '''
+        :param train_inputs: torch.tensor(x),     shape=(batch_size, source_node)
+        :param train_types:  torch.tensor(t),     shape=(batch_size, edge_type)
+        :param node_neigh:   torch.tensor(neigh)  shape=(batch_size, edge_type_count, neighbour_num)
+        :return:
+        '''
         if self.features is None:
-            node_embed = self.node_embeddings[train_inputs]
+            node_embed = self.node_embeddings[train_inputs]  # batch_size, embedding_size
             node_embed_neighbors = self.node_type_embeddings[node_neigh]
+            # batch_size, edge_type_count, neighbour_num, edge_type_count, embedding_u_size
+
         else:
             node_embed = torch.mm(self.features[train_inputs], self.embed_trans)
+            # einsum 爱因斯坦求和表达https://blog.csdn.net/weixin_45101959/article/details/124483226
+            # edge_type_count, feature_dim, embedding_u_size = akm
+            # num_nodes, edge_type_count, neighbour_num, feature_dim = bijk
             node_embed_neighbors = torch.einsum('bijk,akm->bijam', self.features[node_neigh], self.u_embed_trans)
+        # node_embed_tmp=(batch_size, edge_type_count, neighbour_num, embedding_u_size)
         node_embed_tmp = torch.diagonal(node_embed_neighbors, dim1=1, dim2=3).permute(0, 3, 1, 2)
+        # node_embed_tmp=(batch_size, edge_type_count, embedding_u_size)
         node_type_embed = torch.sum(node_embed_tmp, dim=2)
-
+        # trans_weights=(edge_type_count, embedding_u_size, embedding_size)
+        # train_types = (batch_size)
         trans_w = self.trans_weights[train_types]
+        # trans_w = (batch_size, embedding_u_size, embedding_size)
+        # trans_weights_s1 = (edge_type_count, embedding_u_size, dim_a)
         trans_w_s1 = self.trans_weights_s1[train_types]
+        # trans_w_s1 = (batch_size, embedding_u_size, dim_a)
+        # trans_weights_s2= (edge_type_count, dim_a, 1)
         trans_w_s2 = self.trans_weights_s2[train_types]
-
+        # trans_w_s2 = (batch_size, dim_a, 1)
         attention = F.softmax(
             torch.matmul(
+                #                 (batch_size, edge_type_count, dim_a)  -->  batch_size, edge_type_count, 1
                 torch.tanh(torch.matmul(node_type_embed, trans_w_s1)), trans_w_s2
             ).squeeze(2),
             dim=1,
-        ).unsqueeze(1)
+        ).unsqueeze(1)  # batch_size, 1, edge_type_count
+        # batch_size, edge_type_count, embedding_u_size ->  batch_size, 1, embedding_u_size
         node_type_embed = torch.matmul(attention, node_type_embed)
+        # batch_size, embedding_size
         node_embed = node_embed + torch.matmul(node_type_embed, trans_w).squeeze(1)
 
         last_node_embed = F.normalize(node_embed, dim=1)
@@ -99,6 +131,11 @@ class GATNEModel(nn.Module):
 
 class NSLoss(nn.Module):
     def __init__(self, num_nodes, num_sampled, embedding_size):
+        '''
+        :param num_nodes:  list of all nodes
+        :param num_sampled: 负样本采样数
+        :param embedding_size:
+        '''
         super(NSLoss, self).__init__()
         self.num_nodes = num_nodes
         self.num_sampled = num_sampled
@@ -108,7 +145,7 @@ class NSLoss(nn.Module):
             torch.Tensor(
                 [
                     (math.log(k + 2) - math.log(k + 1)) / math.log(num_nodes + 1)
-                    for k in range(num_nodes)
+                    for k in range(num_nodes) # quest1on
                 ]
             ),
             dim=0,
@@ -120,25 +157,44 @@ class NSLoss(nn.Module):
         self.weights.data.normal_(std=1.0 / math.sqrt(self.embedding_size))
 
     def forward(self, input, embs, label):
-        n = input.shape[0]
+        '''
+        :param input: source_node
+        :param embs:
+        :param label: end_node
+        :return:
+        '''
+        n = input.shape[0] #batch_size
         log_target = torch.log(
-            torch.sigmoid(torch.sum(torch.mul(embs, self.weights[label]), 1))
+            torch.sigmoid(torch.sum(torch.mul(embs, self.weights[label]), 1)) #每个source乘以endnode的weight
         )
+        #以输入的张量作为权重进行多分布采样
         negs = torch.multinomial(
             self.sample_weights, self.num_sampled * n, replacement=True
         ).view(n, self.num_sampled)
-        noise = torch.neg(self.weights[negs])
-        sum_log_sampled = torch.sum(
+        # negs = (batch_size, num_sampled, embedding_size)
+        noise = torch.neg(self.weights[negs]) #取负
+
+        sum_log_sampled = torch.sum(                 #embs.unsqueeze=(batch_size, embedding_size, 1)
             torch.log(torch.sigmoid(torch.bmm(noise, embs.unsqueeze(2)))), 1
         ).squeeze()
 
-        loss = log_target + sum_log_sampled
+        loss = log_target + sum_log_sampled  #quest1on
         return -loss.sum() / n
 
 
-def train_model(network_data, feature_dic):
-    vocab, index2word, train_pairs = generate(network_data, args.num_walks, args.walk_length, args.schema, file_name, args.window_size, args.num_workers, args.walk_file)
 
+def train_model(network_data, feature_dic):
+    '''
+    :param network_data: 训练集，key为边对类型，value为相连node对的list
+    :param feature_dic: 特征字典，key为node序号，value为对应特征
+    :return:
+    '''
+
+    #vocab:字典vocab[node]=Node(count,index)实例
+    #index2word: 全node列表，顺序与vocab[node].index一致
+    #train_pairs: node对(node1, node2, layer_id)
+    vocab, index2word, train_pairs = generate(network_data, args.num_walks, args.walk_length,\
+    args.schema, file_name, args.window_size, args.num_workers, args.walk_file)
     edge_types = list(network_data.keys())
 
     num_nodes = len(index2word)
@@ -156,7 +212,7 @@ def train_model(network_data, feature_dic):
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
     neighbors = generate_neighbors(network_data, vocab, num_nodes, edge_types, neighbor_samples)
-
+    #neighbors'shape = (num_node, edge_type_count, neighbor_samples)
     features = None
     if feature_dic is not None:
         feature_dim = len(list(feature_dic.values())[0])
@@ -185,6 +241,10 @@ def train_model(network_data, feature_dic):
     for epoch in range(epochs):
         random.shuffle(train_pairs)
         batches = get_batches(train_pairs, neighbors, batch_size)
+        #each batch[0]= source node
+        #each batch[1]= end node
+        #each batch[2]= edge type
+        #each batch[3]= source node's neighs for each type (shape=(edge_type_count, neighbor_samples))
 
         data_iter = tqdm(
             batches,
@@ -213,13 +273,14 @@ def train_model(network_data, feature_dic):
                 data_iter.write(str(post_fix))
 
         final_model = dict(zip(edge_types, [dict() for _ in range(edge_type_count)]))
+        # final_model={edge_type: {}}
         for i in range(num_nodes):
             train_inputs = torch.tensor([i for _ in range(edge_type_count)]).to(device)
             train_types = torch.tensor(list(range(edge_type_count))).to(device)
             node_neigh = torch.tensor(
                 [neighbors[i] for _ in range(edge_type_count)]
             ).to(device)
-            node_emb = model(train_inputs, train_types, node_neigh)
+            node_emb = model(train_inputs, train_types, node_neigh) #推理
             for j in range(edge_type_count):
                 final_model[edge_types[j]][index2word[i]] = (
                     node_emb[j].cpu().detach().numpy()
@@ -231,8 +292,8 @@ def train_model(network_data, feature_dic):
             if args.eval_type == "all" or edge_types[i] in args.eval_type.split(","):
                 tmp_auc, tmp_f1, tmp_pr = evaluate(
                     final_model[edge_types[i]],
-                    valid_true_data_by_edge[edge_types[i]],
-                    valid_false_data_by_edge[edge_types[i]],
+                    valid_true_data_by_edge[edge_types[i]], #node对
+                    valid_false_data_by_edge[edge_types[i]],#node对
                 )
                 valid_aucs.append(tmp_auc)
                 valid_f1s.append(tmp_f1)

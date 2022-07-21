@@ -125,4 +125,7 @@ dmypy.json
 
 .vscode
 runs/
-src/__pycache__
+src/__pycache_
+
+.DS_Store
+.idea/
